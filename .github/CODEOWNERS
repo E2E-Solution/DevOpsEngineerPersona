@@ -1,0 +1,61 @@
+# ============================================================================
+# CODEOWNERS - Maps file ownership to teams/agents
+# ============================================================================
+# This file defines who is responsible for reviewing changes to different
+# parts of the codebase. It also maps to the specialized Copilot agents
+# defined in .github/agents/ — each agent's scope aligns with a CODEOWNERS entry.
+#
+# Format: <pattern> <owner1> <owner2> ...
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# ============================================================================
+
+# ── Default: Require review for all changes ──────────────────────────────────
+*                                   @Azure-Samples/maintainers
+
+# ── Frontend (React components, hooks, styles) ──────────────────────────────
+/src/                               @Azure-Samples/frontend
+/src/components/ui/                 @Azure-Samples/frontend
+/index.html                        @Azure-Samples/frontend
+
+# ── API (Azure Functions, Cosmos DB, email) ──────────────────────────────────
+/api/                               @Azure-Samples/backend
+
+# ── Infrastructure (Bicep, deployment, monitoring) ───────────────────────────
+# Maps to: DevOps Engineer agent (.github/agents/devops-engineer.md)
+/infra/                             @Azure-Samples/platform
+/.github/workflows/                 @Azure-Samples/platform
+/scripts/                           @Azure-Samples/platform
+/docker-compose.yml                 @Azure-Samples/platform
+/staticwebapp.config.json           @Azure-Samples/platform
+/.devcontainer/                     @Azure-Samples/platform
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+# Maps to: Test Engineer agent (.github/agents/test-engineer.md)
+/api/src/__tests__/                 @Azure-Samples/testing
+/e2e/                               @Azure-Samples/testing
+/tests/                             @Azure-Samples/testing
+/playwright.config.ts               @Azure-Samples/testing
+
+# ── Translations (i18n) ─────────────────────────────────────────────────────
+# Maps to: Localization Expert agent (.github/agents/localization-expert.md)
+/src/lib/translations/              @Azure-Samples/localization
+
+# ── Documentation ────────────────────────────────────────────────────────────
+# Maps to: Documentation Writer agent (.github/agents/documentation-writer.md)
+/docs/                              @Azure-Samples/docs
+/*.md                               @Azure-Samples/docs
+
+# ── Security-sensitive files (require platform team review) ──────────────────
+# Maps to: Security Reviewer agent (.github/agents/security-reviewer.md)
+/api/src/shared/rate-limiter.ts     @Azure-Samples/platform @Azure-Samples/backend
+/api/src/shared/game-utils.ts       @Azure-Samples/platform @Azure-Samples/backend
+/staticwebapp.config.json           @Azure-Samples/platform
+/SECURITY.md                        @Azure-Samples/platform
+
+# ── Copilot configuration (governance) ───────────────────────────────────────
+/.github/copilot-instructions.md    @Azure-Samples/platform
+/.github/copilot-constitution.md    @Azure-Samples/platform
+/.github/copilot-memory.md          @Azure-Samples/platform
+/.github/agents/                    @Azure-Samples/platform
+/.github/specs/                     @Azure-Samples/platform
+/.github/prompts/                   @Azure-Samples/platform

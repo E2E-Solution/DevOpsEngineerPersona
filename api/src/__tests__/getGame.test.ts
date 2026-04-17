@@ -1,0 +1,321 @@
+import { HttpRequest, InvocationContext } from '@azure/functions'
+import { getGameHandler } from '../functions/getGame'
+import { Game } from '../shared/types'
+
+// Mock the cosmosdb module
+jest.mock('../shared/cosmosdb', () => ({
+  getGameByCode: jest.fn(),
+  getDatabaseStatus: jest.fn()
+}))
+
+jest.mock('../shared/game-utils', () => ({
+  safeCompare: jest.fn().mockImplementation((a: string, b: string) => {
+    if (!a || !b) return false
+    return a === b
+  })
+}))
+
+jest.mock('../shared/rate-limiter', () => ({
+  checkRateLimit: jest.fn().mockReturnValue(null)
+}))
+
+import { getGameByCode, getDatabaseStatus } from '../shared/cosmosdb'
+
+const mockGetGameByCode = getGameByCode as jest.Mock
+const mockGetDatabaseStatus = getDatabaseStatus as jest.Mock
+
+describe('getGame function', () => {
+  let mockContext: InvocationContext
+
+  const testGame: Game = {
+    id: 'game-1',
+    code: '123456',
+    name: 'Test Game',
+    amount: '20',
+    currency: 'USD',
+    date: '2025-12-25',
+    location: 'Office',
+    allowReassignment: true,
+    isProtected: false,
+    generalNotes: 'Test notes',
+    participants: [
+      { id: 'p1', name: 'Alice', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false },
+      { id: 'p2', name: 'Bob', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false },
+      { id: 'p3', name: 'Charlie', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false }
+    ],
+    assignments: [
+      { giverId: 'p1', receiverId: 'p2' },
+      { giverId: 'p2', receiverId: 'p3' },
+      { giverId: 'p3', receiverId: 'p1' }
+    ],
+    reassignmentRequests: [],
+    organizerToken: 'token-123',
+    createdAt: Date.now()
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    
+    mockContext = {
+      log: jest.fn(),
+      error: jest.fn(),
+      warn: jest.fn(),
+    } as unknown as InvocationContext
+
+    mockGetDatabaseStatus.mockReturnValue({ connected: true, error: null })
+  })
+
+  const createMockRequest = (code?: string, query?: Record<string, string>): HttpRequest => {
+    const searchParams = new URLSearchParams(query)
+    return {
+      method: 'GET',
+      url: `http://localhost/api/games/${code || ''}`,
+      headers: new Headers(),
+      query: searchParams,
+      params: { code }
+    } as unknown as HttpRequest
+  }
+
+  it('should return game when found', async () => {
+    mockGetGameByCode.mockResolvedValueOnce(testGame)
+
+    const mockRequest = createMockRequest('123456')
+    const response = await getGameHandler(mockRequest, mockContext)
+
+    expect(response.status).toBe(200)
+    // For non-protected games without participantId, tokens and assignments should be stripped
+    const responseBody = response.jsonBody as any
+    expect(responseBody.code).toBe('123456')
+    // Privacy: Organizer email should be hidden
+    expect(responseBody.organizerEmail).toBeUndefined()
+    // Privacy: All participant tokens, emails, and confirmation statuses should be hidden
+    responseBody.participants.forEach((p: any) => {
+      expect(p.token).toBeUndefined()
+      expect(p.email).toBeUndefined()
+      expect(p.hasConfirmedAssignment).toBe(false) // Should be hidden (false for anonymous)
+      expect(p.hasPendingReassignmentRequest).toBe(false) // Should be hidden (false for anonymous)
+    })
+    // Security: Assignments should NOT be exposed to anonymous users
+    expect(responseBody.assignments).toEqual([])
+  })
+
+  it('should return 404 when game not found', async () => {
+    mockGetGameByCode.mockResolvedValueOnce(null)
+
+    const mockRequest = createMockRequest('999999')
+    const response = await getGameHandler(mockRequest, mockContext)
+
+    expect(response.status).toBe(404)
+    expect(response.jsonBody).toEqual({ error: 'Game not found' })
+  })
+
+  it('should return 400 when code is missing', async () => {
+    const mockRequest = {
+      method: 'GET',
+      url: 'http://localhost/api/games/',
+      headers: new Headers(),
+      query: new URLSearchParams(),
+      params: {}
+    } as unknown as HttpRequest
+
+    const response = await getGameHandler(mockRequest, mockContext)
+
+    expect(response.status).toBe(400)
+    expect(response.jsonBody).toEqual({ error: 'Game code is required' })
+  })
+
+  it('should return 503 when database is not connected', async () => {
+    mockGetDatabaseStatus.mockReturnValue({
+      connected: false,
+      error: 'Connection timeout'
+    })
+
+    const mockRequest = createMockRequest('123456')
+    const response = await getGameHandler(mockRequest, mockContext)
+
+    expect(response.status).toBe(503)
+    expect(response.jsonBody).toEqual({
+      error: 'Database not available'
+    })
+  })
+
+  it('should return 500 on database error', async () => {
+    mockGetGameByCode.mockRejectedValueOnce(new Error('Query failed'))
+
+    const mockRequest = createMockRequest('123456')
+    const response = await getGameHandler(mockRequest, mockContext)
+
+    expect(response.status).toBe(500)
+    expect(response.jsonBody).toEqual({
+      error: 'Failed to get game'
+    })
+  })
+
+  it('should log game code being fetched', async () => {
+    mockGetGameByCode.mockResolvedValueOnce(testGame)
+
+    const mockRequest = createMockRequest('123456')
+    await getGameHandler(mockRequest, mockContext)
+
+    expect(mockContext.log).toHaveBeenCalledWith('Getting game with code: 123456')
+  })
+
+  // Protected game tests
+  describe('protected games', () => {
+    const protectedGame: Game = {
+      ...testGame,
+      isProtected: true,
+      participants: [
+        { id: 'p1', name: 'Alice', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false, token: 'alice-token' },
+        { id: 'p2', name: 'Bob', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false, token: 'bob-token' },
+        { id: 'p3', name: 'Charlie', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false, token: 'charlie-token' }
+      ]
+    }
+
+    it('should return minimal info for protected game without token', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(protectedGame)
+
+      const mockRequest = createMockRequest('123456')
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      expect(body.requiresToken).toBe(true)
+      expect(body.isProtected).toBe(true)
+      expect(body.code).toBe('123456')
+      expect(body.name).toBe('Test Game')
+      expect(body.participants).toBeUndefined()
+      expect(body.assignments).toBeUndefined()
+    })
+
+    it('should return full game for organizer with valid token', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(protectedGame)
+
+      const mockRequest = createMockRequest('123456', { organizerToken: 'token-123' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      expect(body.participants).toHaveLength(3)
+      expect(body.assignments).toHaveLength(3)
+      expect(body.organizerToken).toBe('token-123')
+    })
+
+    it('should return sanitized game for participant with valid token', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(protectedGame)
+
+      const mockRequest = createMockRequest('123456', { participantToken: 'alice-token' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      expect(body.authenticatedParticipantId).toBe('p1')
+      expect(body.organizerToken).toBe('') // Hidden
+      expect(body.organizerEmail).toBeUndefined() // Hidden
+      // Only Alice should have her token visible
+      const alice = body.participants.find((p: any) => p.id === 'p1')
+      const bob = body.participants.find((p: any) => p.id === 'p2')
+      expect(alice.token).toBe('alice-token')
+      expect(bob.token).toBeUndefined()
+      // Only Alice's assignment (p1 -> p2) should be included, not the giver assignment
+      expect(body.assignments).toHaveLength(1)
+      expect(body.assignments).toContainEqual({ giverId: 'p1', receiverId: 'p2' })
+      // giverHasConfirmed flag should be included (p3 gives to p1, check their confirmation status)
+      expect(body.giverHasConfirmed).toBeDefined()
+      expect(body.giverHasConfirmed).toBe(false)
+    })
+
+    it('should return giverHasConfirmed true when giver has confirmed', async () => {
+      // Create game where p3 (Alice's giver) has confirmed their assignment
+      const gameWithConfirmedGiver = {
+        ...protectedGame,
+        participants: [
+          { id: 'p1', name: 'Alice', desiredGift: '', wish: '', token: 'alice-token', hasConfirmedAssignment: false, hasPendingReassignmentRequest: false },
+          { id: 'p2', name: 'Bob', desiredGift: '', wish: '', token: 'bob-token', hasConfirmedAssignment: false, hasPendingReassignmentRequest: false },
+          { id: 'p3', name: 'Charlie', desiredGift: '', wish: '', token: 'charlie-token', hasConfirmedAssignment: true, hasPendingReassignmentRequest: false } // Confirmed
+        ]
+      }
+      mockGetGameByCode.mockResolvedValueOnce(gameWithConfirmedGiver)
+
+      const mockRequest = createMockRequest('123456', { participantToken: 'alice-token' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      // p3 gives to p1, and p3 has confirmed, so giverHasConfirmed should be true
+      expect(body.giverHasConfirmed).toBe(true)
+    })
+
+    it('should return 403 for invalid participant token', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(protectedGame)
+
+      const mockRequest = createMockRequest('123456', { participantToken: 'invalid-token' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(403)
+      expect(response.jsonBody).toEqual({ error: 'Invalid participant token' })
+    })
+  })
+
+  // Non-protected game with participantId filtering
+  describe('non-protected games with participantId', () => {
+    it('should return filtered game for participant with participantId', async () => {
+      // Add email fields to test game for privacy verification
+      const gameWithEmails = {
+        ...testGame,
+        organizerEmail: 'organizer@example.com',
+        participants: [
+          { id: 'p1', name: 'Alice', email: 'alice@example.com', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false },
+          { id: 'p2', name: 'Bob', email: 'bob@example.com', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false },
+          { id: 'p3', name: 'Charlie', email: 'charlie@example.com', desiredGift: '', wish: '', hasPendingReassignmentRequest: false, hasConfirmedAssignment: false }
+        ]
+      }
+      mockGetGameByCode.mockResolvedValueOnce(gameWithEmails)
+
+      const mockRequest = createMockRequest('123456', { participantId: 'p1' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      expect(body.authenticatedParticipantId).toBe('p1')
+      expect(body.organizerToken).toBe('') // Hidden
+      expect(body.organizerEmail).toBeUndefined() // Hidden for privacy
+      // Only p1's assignment (p1 -> p2) should be included
+      expect(body.assignments).toHaveLength(1)
+      expect(body.assignments).toContainEqual({ giverId: 'p1', receiverId: 'p2' })
+      // giverHasConfirmed flag should be included (p3 gives to p1, check their confirmation status)
+      expect(body.giverHasConfirmed).toBeDefined()
+      expect(body.giverHasConfirmed).toBe(false)
+      // Privacy: only p1's email should be visible
+      const p1 = body.participants.find((p: any) => p.id === 'p1')
+      const p2 = body.participants.find((p: any) => p.id === 'p2')
+      expect(p1.email).toBe('alice@example.com') // Own email visible
+      expect(p2.email).toBeUndefined() // Other emails hidden
+      // Privacy: only p1's confirmation status should be visible
+      expect(p1.hasConfirmedAssignment).toBe(false) // Own status visible
+      expect(p2.hasConfirmedAssignment).toBe(false) // Other statuses hidden (returned as false)
+      expect(p2.hasPendingReassignmentRequest).toBe(false) // Other statuses hidden (returned as false)
+    })
+
+    it('should return 404 for invalid participantId', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(testGame)
+
+      const mockRequest = createMockRequest('123456', { participantId: 'invalid-id' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(404)
+      expect(response.jsonBody).toEqual({ error: 'Participant not found' })
+    })
+
+    it('should return full game for organizer of non-protected game with valid token', async () => {
+      mockGetGameByCode.mockResolvedValueOnce(testGame)
+
+      const mockRequest = createMockRequest('123456', { organizerToken: 'token-123' })
+      const response = await getGameHandler(mockRequest, mockContext)
+
+      expect(response.status).toBe(200)
+      const body = response.jsonBody as any
+      expect(body.organizerToken).toBe('token-123')
+    })
+  })
+})

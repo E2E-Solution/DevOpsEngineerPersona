@@ -1,0 +1,17 @@
+version: v0.1
+testId: zava-gift-exchange-load-test
+displayName: Zava Gift Exchange - Load Test
+description: Load test for the Zava Gift Exchange web app (100 concurrent users, 60s)
+
+testPlan: load-test.jmx
+
+engineInstances: 1
+
+failureCriteria:
+  - avg(response_time_ms) > 2000
+  - percentage(error) > 5
+  - p95(response_time_ms) > 5000
+
+autoStop:
+  errorPercentage: 50
+  timeWindow: 60

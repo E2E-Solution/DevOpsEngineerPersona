@@ -1,0 +1,712 @@
+# ============================================================================
+# Zava Gift Exchange - CI/CD Pipeline
+# ============================================================================
+#
+# Pipeline Flow (visualized):
+#
+#   ┌─────────────┐    ┌──────────┐
+#   │ Build & Test │───▶│ E2E Tests│
+#   └─────────────┘    └────┬─────┘
+#                           │
+#          ┌────────────────┼────────────────┐
+#          │ (PR)           │                │ (main push)
+#          ▼                │                ▼
+#   ┌──────────────┐       │         ┌──────────────┐
+#   │ PR Infra     │       │         │ QA Infra     │
+#   └──────┬───────┘       │         └──────┬───────┘
+#          ▼               │                ▼
+#   ┌──────────────┐       │         ┌──────────────┐
+#   │ PR Preview   │       │         │ Deploy QA    │
+#   └──────┬───────┘       │         └──────┬───────┘
+#          ▼               │                ▼
+#   ┌──────────────┐       │         ┌──────────────┐
+#   │ E2E (Preview)│       │         │ E2E (QA)     │
+#   └──────────────┘       │         └──────┬───────┘
+#                          │                ▼
+#   ┌──────────────┐       │         ┌──────────────┐
+#   │ Close PR     │◀──(PR closed)   │ Load Test(QA)│
+#   │ (cleanup)    │       │         └──────┬───────┘
+#   └──────────────┘       │                ▼
+#                          │         ┌──────────────┐
+#                          │         │ Prod Infra   │
+#                          │         └──────┬───────┘
+#                          │                ▼
+#                          │         ┌──────────────┐
+#                          │         │ Deploy Prod  │
+#                          │         │ (approval)   │
+#                          │         └──────────────┘
+#
+# Environment Strategy:
+#   PR   → Ephemeral resource group per PR (auto-created/deleted)
+#   QA   → Isolated resource group (ZavaGiftExchange-qa)
+#   Prod → Production resource group (ZavaGiftExchange)
+#
+# Required Secrets:
+#   AZURE_CREDENTIALS - Service principal JSON for Azure CLI/ARM deployments
+#   CLEANUP_SECRET    - Shared secret for the cleanup HTTP endpoint
+#
+# ============================================================================
+
+name: CI/CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+# Cancel in-progress runs for the same PR or branch to save resources
+concurrency:
+  group: ci-cd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20.19.0'
+  AZURE_LOCATION: 'eastus2'
+  PROJECT_NAME: 'ZavaGiftExchange'
+  AZURE_RESOURCE_GROUP: 'ZavaGiftExchange'
+  AZURE_QA_RESOURCE_GROUP: 'ZavaGiftExchange-qa'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ==========================================================================
+  # BUILD & TEST
+  # Installs dependencies, lints, builds both frontend and API, runs unit
+  # tests, and uploads build artifacts for downstream deployment jobs.
+  # ==========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          cd api && npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build API
+        run: cd api && npm run build
+
+      - name: Run API tests
+        run: cd api && npm test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build
+          path: |
+            dist/
+            api/dist/
+          retention-days: 1
+
+  # ==========================================================================
+  # E2E TESTS (Local)
+  # Runs Playwright end-to-end tests against the local Vite dev server.
+  # This validates the app works before any deployment.
+  # ==========================================================================
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: npx playwright test --project=chromium
+
+      - name: Upload E2E test report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+      - name: E2E Test Summary
+        if: always()
+        run: bash scripts/e2e-summary.sh "E2E Test Results" "" "playwright-report"
+
+  # ==========================================================================
+  # PR INFRASTRUCTURE DEPLOYMENT
+  # Creates an ephemeral Azure resource group for the PR with all necessary
+  # resources (Static Web App, Cosmos DB, App Insights). Validates the Bicep
+  # template before deploying.
+  # ==========================================================================
+  deploy-pr-infrastructure:
+    name: Deploy PR Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: e2e
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    outputs:
+      resource_group: ${{ steps.rg.outputs.name }}
+      static_web_app_url: ${{ steps.infra.outputs.staticWebAppUrl }}
+      static_web_app_name: ${{ steps.infra.outputs.staticWebAppName }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group for PR
+        id: rg
+        run: |
+          RG_NAME="${{ env.PROJECT_NAME }}-pr-${{ github.event.pull_request.number }}"
+          echo "name=$RG_NAME" >> $GITHUB_OUTPUT
+          az group create --name "$RG_NAME" --location "${{ env.AZURE_LOCATION }}" --tags "pr=${{ github.event.pull_request.number }}" "repo=${{ github.repository }}"
+          echo "✅ Created resource group: $RG_NAME"
+
+      - name: Validate PR Infrastructure
+        run: |
+          echo "Validating PR Bicep template..."
+          az deployment group validate \
+            --resource-group ${{ steps.rg.outputs.name }} \
+            --template-file ./infra/main.bicep \
+            --parameters \
+              projectName=${{ env.PROJECT_NAME }} \
+              environment=pr \
+              prNumber=${{ github.event.pull_request.number }} \
+              staticWebAppSku=Standard \
+              enableEmailService=false \
+              repositoryUrl=https://github.com/${{ github.repository }} \
+              repositoryBranch=${{ github.head_ref }} \
+              deploymentId=pr-${{ github.event.pull_request.number }}
+          echo "✅ PR template validation passed"
+
+      - name: Deploy Infrastructure
+        id: infra
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          resourceGroupName: ${{ steps.rg.outputs.name }}
+          template: ./infra/main.bicep
+          parameters: >
+            projectName=${{ env.PROJECT_NAME }}
+            environment=pr
+            prNumber=${{ github.event.pull_request.number }}
+            staticWebAppSku=Standard
+            enableEmailService=false
+            repositoryUrl=https://github.com/${{ github.repository }}
+            repositoryBranch=${{ github.head_ref }}
+            deploymentId=pr-${{ github.event.pull_request.number }}
+          deploymentMode: Incremental
+          failOnStdErr: true
+
+      - name: Output Infrastructure Details
+        run: |
+          echo "## 🏗️ PR Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | \`${{ steps.rg.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Static Web App | ${{ steps.infra.outputs.staticWebAppUrl }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosmos DB | ${{ steps.infra.outputs.cosmosAccountName }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Insights | ${{ steps.infra.outputs.appInsightsName }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # PR PREVIEW DEPLOYMENT
+  # Deploys the built application to the PR's Static Web App so reviewers
+  # can test the changes in a live environment.
+  # ==========================================================================
+  preview:
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: deploy-pr-infrastructure
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    outputs:
+      preview_url: ${{ steps.deploy.outputs.static_web_app_url }}
+    environment:
+      name: pr
+      url: ${{ steps.deploy.outputs.static_web_app_url }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+
+      - name: Get Static Web App Token
+        id: swa-token
+        run: |
+          TOKEN=$(az staticwebapp secrets list --name "${{ needs.deploy-pr-infrastructure.outputs.static_web_app_name }}" --resource-group "${{ needs.deploy-pr-infrastructure.outputs.resource_group }}" --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Preview
+        id: deploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa-token.outputs.token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: dist
+          api_location: api
+          output_location: .
+          skip_app_build: true
+          skip_api_build: false
+
+      - name: Preview Deployment Summary
+        run: |
+          echo "## 🟡 PR Preview Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ steps.deploy.outputs.static_web_app_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Resource Group:** \`${{ needs.deploy-pr-infrastructure.outputs.resource_group }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # E2E TESTS AGAINST PR PREVIEW
+  # Runs Playwright tests against the live PR preview URL to validate
+  # the deployment works end-to-end in Azure.
+  # ==========================================================================
+  e2e-pr:
+    name: E2E Tests (Preview)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [preview]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for preview deployment to stabilize
+        run: sleep 30
+
+      - name: Run E2E tests against Preview
+        env:
+          BASE_URL: ${{ needs.preview.outputs.preview_url }}
+        run: npx playwright test --project=chromium
+
+      - name: Upload Preview E2E test report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report-preview
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Preview E2E Test Summary
+        if: always()
+        run: bash scripts/e2e-summary.sh "Preview E2E Test Results" "${{ needs.preview.outputs.preview_url }}" "playwright-report-preview"
+
+  # ==========================================================================
+  # CLOSE PR - DELETE INFRASTRUCTURE
+  # When a PR is closed (merged or abandoned), deletes the ephemeral
+  # resource group to clean up all Azure resources.
+  # ==========================================================================
+  close-preview:
+    name: Close Preview & Delete Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Delete Resource Group
+        run: |
+          RG_NAME="${{ env.PROJECT_NAME }}-pr-${{ github.event.pull_request.number }}"
+          echo "🗑️ Deleting resource group: $RG_NAME"
+          az group delete --name "$RG_NAME" --yes --no-wait
+          echo "✅ Resource group deletion initiated (running in background)"
+
+      - name: Comment PR
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const rg = '${{ env.PROJECT_NAME }}-pr-${{ github.event.pull_request.number }}';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🧹 Preview Environment Cleaned Up\n\nResource group \`${rg}\` is being deleted.\n\n_All Azure resources for this PR have been removed._`
+            });
+
+  # ==========================================================================
+  # QA INFRASTRUCTURE DEPLOYMENT
+  # Deploys infrastructure to the persistent QA resource group.
+  # Only runs on pushes to main after E2E tests pass.
+  # ==========================================================================
+  deploy-qa-infrastructure:
+    name: Deploy QA Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: e2e
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      resource_group: ${{ steps.rg.outputs.name }}
+      static_web_app_url: ${{ steps.infra.outputs.staticWebAppUrl }}
+      static_web_app_name: ${{ steps.infra.outputs.staticWebAppName }}
+      load_test_resource: ${{ steps.infra.outputs.loadTestResourceName }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create/Verify QA Resource Group
+        id: rg
+        run: |
+          RG_NAME="${{ env.AZURE_QA_RESOURCE_GROUP }}"
+          echo "name=$RG_NAME" >> $GITHUB_OUTPUT
+          az group create --name "$RG_NAME" --location "${{ env.AZURE_LOCATION }}" --tags "environment=qa" "project=${{ env.PROJECT_NAME }}"
+          echo "✅ QA resource group ready: $RG_NAME"
+
+      - name: Validate QA Infrastructure
+        run: |
+          echo "Validating Bicep template for QA environment..."
+          az deployment group validate \
+            --resource-group ${{ steps.rg.outputs.name }} \
+            --template-file ./infra/main.bicep \
+            --parameters ./infra/parameters.qa.json deploymentId=qa-stable "cleanupSecret=${{ secrets.CLEANUP_SECRET }}"
+          echo "✅ Template validation passed"
+
+      - name: Deploy QA Infrastructure
+        id: infra
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          resourceGroupName: ${{ steps.rg.outputs.name }}
+          template: ./infra/main.bicep
+          parameters: ./infra/parameters.qa.json deploymentId=qa-stable "cleanupSecret=${{ secrets.CLEANUP_SECRET }}"
+          deploymentMode: Incremental
+          failOnStdErr: true
+
+      - name: QA Infrastructure Summary
+        run: |
+          echo "## 🏗️ QA Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | \`${{ steps.rg.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Static Web App | ${{ steps.infra.outputs.staticWebAppUrl }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosmos DB | \`${{ steps.infra.outputs.cosmosAccountName }}\` (Serverless) |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Insights | \`${{ steps.infra.outputs.appInsightsName }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tier:** Standard (isolated from production)" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # QA DEPLOYMENT
+  # Deploys the built app to the QA Static Web App.
+  # ==========================================================================
+  deploy-qa:
+    name: Deploy to QA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: deploy-qa-infrastructure
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      deployed_url: ${{ steps.deploy.outputs.static_web_app_url }}
+    environment:
+      name: qa
+      url: ${{ steps.deploy.outputs.static_web_app_url }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+
+      - name: Get Static Web App Token
+        id: swa-token
+        run: |
+          TOKEN=$(az staticwebapp secrets list --name "${{ needs.deploy-qa-infrastructure.outputs.static_web_app_name }}" --resource-group "${{ needs.deploy-qa-infrastructure.outputs.resource_group }}" --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to QA
+        id: deploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa-token.outputs.token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: dist
+          api_location: api
+          output_location: .
+          skip_app_build: true
+          skip_api_build: false
+
+      - name: QA Deployment Summary
+        run: |
+          echo "## 🟢 QA Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ steps.deploy.outputs.static_web_app_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Resource Group:** \`${{ needs.deploy-qa-infrastructure.outputs.resource_group }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # E2E TESTS AGAINST QA
+  # Validates the deployed QA environment works before promoting to production.
+  # ==========================================================================
+  e2e-qa:
+    name: E2E Tests (QA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [deploy-qa, deploy-qa-infrastructure]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for QA deployment to stabilize
+        run: sleep 30
+
+      - name: Run E2E tests against QA
+        env:
+          BASE_URL: ${{ needs.deploy-qa.outputs.deployed_url }}
+        run: npx playwright test --project=chromium
+
+      - name: Upload QA E2E test report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report-qa
+          path: playwright-report/
+          retention-days: 7
+
+      - name: QA E2E Test Summary
+        if: always()
+        run: bash scripts/e2e-summary.sh "QA E2E Test Results" "${{ needs.deploy-qa.outputs.deployed_url }}" "playwright-report-qa"
+
+  # ==========================================================================
+  # LOAD TESTING (QA)
+  # Runs Azure Load Testing against the deployed QA environment — 100
+  # concurrent users hitting the home page for 60 seconds.
+  # ==========================================================================
+  load-test-qa:
+    name: Load Test (QA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [e2e-qa, deploy-qa, deploy-qa-infrastructure]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Inject domain into test plan
+        run: |
+          DOMAIN=$(echo "${{ needs.deploy-qa.outputs.deployed_url }}" | sed 's|https\?://||' | sed 's|/.*||')
+          sed -i "s/REPLACE_DOMAIN/$DOMAIN/g" tests/load/load-test.jmx
+          echo "Injected domain: $DOMAIN"
+          cat tests/load/load-test.jmx
+
+      - name: Run Load Test
+        uses: azure/load-testing@v1
+        with:
+          loadTestConfigFile: tests/load/config.yaml
+          loadTestResource: ${{ needs.deploy-qa-infrastructure.outputs.load_test_resource }}
+          resourceGroup: ${{ needs.deploy-qa-infrastructure.outputs.resource_group }}
+
+      - name: Load Test Summary
+        if: always()
+        run: |
+          echo "## 📊 Load Test Results (QA)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ needs.deploy-qa.outputs.deployed_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Config:** 100 concurrent users, 60s duration, 30s ramp-up" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View detailed results in the [Azure Load Testing portal](https://portal.azure.com/#view/Microsoft_Azure_CloudNativeTesting/NewReport)." >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # PRODUCTION INFRASTRUCTURE DEPLOYMENT
+  # Deploys production-tier infrastructure (Standard SWA, Serverless Cosmos DB).
+  # Only runs after QA load tests pass.
+  # ==========================================================================
+  deploy-prod-infrastructure:
+    name: Deploy Production Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: load-test-qa
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      static_web_app_url: ${{ steps.prod-infra.outputs.staticWebAppUrl }}
+      static_web_app_name: ${{ steps.prod-infra.outputs.staticWebAppName }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create/Verify Production Resource Group
+        run: |
+          az group create --name "${{ env.AZURE_RESOURCE_GROUP }}" --location "${{ env.AZURE_LOCATION }}" --tags "environment=prod" "project=${{ env.PROJECT_NAME }}"
+          echo "✅ Production resource group ready: ${{ env.AZURE_RESOURCE_GROUP }}"
+
+      - name: Validate Production Infrastructure
+        run: |
+          echo "Validating Bicep template against current resources..."
+          az deployment group validate \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --template-file ./infra/main.bicep \
+            --parameters ./infra/parameters.prod.json deploymentId=prod-stable "cleanupSecret=${{ secrets.CLEANUP_SECRET }}"
+          echo "✅ Template validation passed"
+
+      - name: Deploy Production Infrastructure
+        id: prod-infra
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          resourceGroupName: ${{ env.AZURE_RESOURCE_GROUP }}
+          template: ./infra/main.bicep
+          parameters: ./infra/parameters.prod.json deploymentId=prod-stable "cleanupSecret=${{ secrets.CLEANUP_SECRET }}"
+          deploymentMode: Incremental
+          failOnStdErr: true
+
+      - name: Production Infrastructure Summary
+        run: |
+          echo "## 🏗️ Production Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | \`${{ env.AZURE_RESOURCE_GROUP }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Static Web App | ${{ steps.prod-infra.outputs.staticWebAppUrl }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosmos DB | \`${{ steps.prod-infra.outputs.cosmosAccountName }}\` (Serverless) |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Insights | \`${{ steps.prod-infra.outputs.appInsightsName }}\` (90-day retention) |" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================================================
+  # PRODUCTION DEPLOYMENT
+  # Deploys the application to production. Uses a GitHub Environment with
+  # optional approval gates for manual review before going live.
+  # ==========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: deploy-prod-infrastructure
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.static_web_app_url }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+
+      - name: Get Static Web App Token
+        id: swa-token
+        run: |
+          TOKEN=$(az staticwebapp secrets list --name "${{ needs.deploy-prod-infrastructure.outputs.static_web_app_name }}" --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Production
+        id: deploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa-token.outputs.token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: dist
+          api_location: api
+          output_location: .
+          skip_app_build: true
+          skip_api_build: false
+
+      - name: Deployment Summary
+        run: |
+          echo "## 🎉 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ steps.deploy.outputs.static_web_app_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

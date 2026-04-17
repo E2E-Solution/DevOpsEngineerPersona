@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zava Gift Exchange - Gift Exchange Organizer</title>
+    <meta name="description" content="Organize your gift exchange easily with Zava. Create games, assign participants, set budgets, and send invitations — all in one place." />
+    <meta name="keywords" content="Zava Gift Exchange, gift exchange, Zava Intercambio de Regalos, holiday" />
+
+    <!-- Open Graph / Social sharing -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Zava Gift Exchange - Gift Exchange Organizer" />
+    <meta property="og:description" content="Organize your gift exchange easily with Zava. Create games, assign participants, set budgets, and send invitations." />
+    <meta property="og:site_name" content="Zava Gift Exchange" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Zava Gift Exchange - Gift Exchange Organizer" />
+    <meta name="twitter:description" content="Organize your gift exchange easily with Zava." />
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#1e3a8a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Zava Gift Exchange" />
+
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@700&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet">
+    <link href="/src/main.css" rel="stylesheet" />
+
+    <!-- JSON-LD structured data for search engine crawlers.
+         Note: <script type="application/ld+json"> is a non-executable data block per the HTML spec
+         and is NOT subject to CSP script-src restrictions (only JavaScript MIME types are restricted).
+         It is safe to include inline even without 'unsafe-inline' in script-src. -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "Zava Gift Exchange",
+      "description": "Organize your gift exchange easily with Zava Gift Exchange. Create games, assign participants, set budgets, and send invitations.",
+      "applicationCategory": "EntertainmentApplication",
+      "operatingSystem": "Any",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      }
+    }
+    </script>
+</head>
+
+<body class="bg-background text-foreground">
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+
+</html>
