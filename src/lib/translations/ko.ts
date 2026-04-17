@@ -2,7 +2,7 @@ import { en } from './en'
 
 export const ko = {
   ...en,
-  appName: '자바 선물 교환',
+  appName: 'Zava 선물 교환',
   welcome: '환영합니다!',
   welcomeDesc: '쉽고 재미있게 선물 교환을 준비하세요',
   createGame: '새 게임 만들기',
