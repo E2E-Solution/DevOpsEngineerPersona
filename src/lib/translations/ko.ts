@@ -1,0 +1,19 @@
+import { en } from './en'
+
+export const ko = {
+  ...en,
+  appName: '자바 선물 교환',
+  welcome: '환영합니다!',
+  welcomeDesc: '쉽고 재미있게 선물 교환을 준비하세요',
+  createGame: '새 게임 만들기',
+  joinGame: '게임 참가하기',
+  enterCode: '코드를 입력하세요',
+  codePlaceholder: '6자리 코드',
+  continue: '계속',
+  back: '뒤로',
+  next: '다음',
+  finish: '완료',
+  cancel: '취소',
+  confirm: '확인',
+  language: '언어'
+}
