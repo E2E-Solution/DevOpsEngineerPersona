@@ -15,5 +15,12 @@ export const ko = {
   finish: '완료',
   cancel: '취소',
   confirm: '확인',
-  language: '언어'
+  language: '언어',
+  darkMode: '다크 모드',
+  lightMode: '라이트 모드',
+  privacyLink: '개인정보 처리방침',
+  guideOrganizerLink: '주최자 가이드',
+  guideParticipantLink: '참가자 가이드',
+  guideOrganizerTitle: '주최자 가이드',
+  guideParticipantTitle: '참가자 가이드'
 }
