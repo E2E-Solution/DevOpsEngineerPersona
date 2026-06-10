@@ -121,10 +121,12 @@ describe('Email Service', () => {
         participants: [{ id: '1' }, { id: '2' }, { id: '3' }]
       } as any
 
-      const content = generateOrganizerEmailContent({ game, language: 'vi' })
-      expect(content.subject).toContain('Holiday Exchange')
-      expect(content.subject).toContain('Your Zava Gift Exchange game')
-      expect(content.html).toContain('Game details')
+      const viContent = generateOrganizerEmailContent({ game, language: 'vi' })
+      const enContent = generateOrganizerEmailContent({ game, language: 'en' })
+
+      expect(viContent.subject).toBe(enContent.subject)
+      expect(viContent.html).toBe(enContent.html)
+      expect(viContent.plainText).toBe(enContent.plainText)
     })
   })
 })

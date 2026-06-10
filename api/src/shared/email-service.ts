@@ -17,10 +17,10 @@ export function escapeHtml(text: string | undefined): string {
 // Helper function to get translation with fallback to English
 function getTranslation<T>(translations: Partial<Record<Language, T>>, language: Language): T {
   const translation = translations[language] ?? translations.en
-  if (translation) {
-    return translation
+  if (!translation) {
+    throw new Error(`English email translation is missing for language "${language}"`)
   }
-  throw new Error('English email translation is missing')
+  return translation
 }
 
 // Email notification types
