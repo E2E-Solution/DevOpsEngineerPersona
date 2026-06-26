@@ -1,8 +1,9 @@
 {
   "name": "Zava Gift Exchange",
-  "image": "mcr.microsoft.com/devcontainers/typescript-node:20",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-20-bookworm",
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:3": {
+      "moby": false,
       "dockerDashComposeVersion": "v2"
     },
     "ghcr.io/devcontainers/features/azure-cli:1": {},
