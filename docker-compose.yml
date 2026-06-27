@@ -2,29 +2,31 @@ services:
   # ============================================================================
   # Cosmos DB Emulator
   # ============================================================================
-  # Local development database using official Azure Cosmos DB Emulator
+  # Local development database using official Azure Cosmos DB Emulator vNext
   # Emulates SQL API behavior on localhost:8081
-  # Certificate is automatically generated on first run
+  # Uses the multi-architecture vNext image so ARM64 hosts can run it natively
   cosmos-db:
-    image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:latest
+    image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-latest
     container_name: cosmosdb-emulator
     ports:
-      - "8081:8081"
+      - "8081:8081"  # Cosmos DB endpoint
+      - "8080:8080"  # Health probes
+      - "1234:1234"  # Data Explorer
     environment:
-      # Emulator environment variables
-      AZURE_COSMOS_EMULATOR_PARTITION_COUNT: 3
-      AZURE_COSMOS_EMULATOR_ENABLE_DATA_PERSISTENCE: 'true'
+      # Match api/local.settings.json.example (COSMOS_ENDPOINT=https://localhost:8081)
+      PROTOCOL: https
+      ENABLE_EXPLORER: 'true'
     volumes:
       # Data persistence for Codespaces reliability
-      - cosmos-db-data:/data/db
+      - cosmos-db-vnext-data:/data
     networks:
       - ZavaGiftExchange-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "-k", "https://localhost:8081/_explorer/emulator.pem"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/ready || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 24
-      start_period: 30s
+      start_period: 15s
     restart: unless-stopped
 
   # ============================================================================
@@ -54,7 +56,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  cosmos-db-data:
+  cosmos-db-vnext-data:
     driver: local
   azurite-data:
     driver: local

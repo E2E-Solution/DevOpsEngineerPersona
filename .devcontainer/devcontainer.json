@@ -44,18 +44,20 @@
       }
     }
   },
-  "forwardPorts": [5173, 7071, 8081, 10000],
+  "forwardPorts": [5173, 7071, 8081, 1234, 10000],
   "portsAttributes": {
     "5173": { "label": "Frontend (Vite)", "onAutoForward": "openBrowser" },
     "7071": { "label": "API (Azure Functions)", "onAutoForward": "silent" },
     "8081": { "label": "Cosmos DB Emulator", "onAutoForward": "silent" },
+    "1234": { "label": "Cosmos DB Data Explorer", "onAutoForward": "silent" },
     "10000": { "label": "Azurite Storage", "onAutoForward": "silent" }
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",
-  "postStartCommand": "docker compose up -d && echo '🎁 Dev environment ready! Press F5 to start debugging.'",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
   "remoteUser": "node",
   "containerEnv": {
     "NODE_ENV": "development",
-    "ENVIRONMENT": "local"
+    "ENVIRONMENT": "local",
+    "DOCKER_CLI_HINTS": "false"
   }
 }
